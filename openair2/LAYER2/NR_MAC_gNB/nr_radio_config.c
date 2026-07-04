@@ -25,6 +25,10 @@
 #include "LAYER2/nr_rlc/nr_rlc_asn1_utils.h"
 #include "bits.h"
 
+#include "NR_SIB20-r17.h"
+#include "NR_MCCH-Config-r17.h"
+#include "NR_MCCH-RepetitionPeriodAndOffset-r17.h"
+
 #include "NR_MeasurementTimingConfiguration.h"
 #include "uper_decoder.h"
 #include "uper_encoder.h"
@@ -3105,6 +3109,29 @@ NR_SIB19_r17_t *get_SIB19_NR(const NR_ServingCellConfigCommon_t *scc)
 void free_SIB19_NR(NR_BCCH_DL_SCH_Message_t *sib19)
 {
   ASN_STRUCT_FREE(asn_DEF_NR_BCCH_DL_SCH_Message, sib19);
+}
+
+NR_SIB20_r17_t *get_SIB20_NR(void)
+{
+  NR_SIB20_r17_t *sib20 = calloc_or_fail(1, sizeof(*sib20));
+  NR_MCCH_Config_r17_t *mcch = &sib20->mcch_Config_r17;
+
+  mcch->mcch_RepetitionPeriodAndOffset_r17.present =
+      NR_MCCH_RepetitionPeriodAndOffset_r17_PR_rf32_r17;
+  mcch->mcch_RepetitionPeriodAndOffset_r17.choice.rf32_r17 = 0;
+
+  mcch->mcch_WindowStartSlot_r17 = 0;
+
+  mcch->mcch_WindowDuration_r17 =
+      calloc_or_fail(1, sizeof(*mcch->mcch_WindowDuration_r17));
+  *mcch->mcch_WindowDuration_r17 =
+      NR_MCCH_Config_r17__mcch_WindowDuration_r17_sl8;
+
+  mcch->mcch_ModificationPeriod_r17 =
+      NR_MCCH_Config_r17__mcch_ModificationPeriod_r17_rf512;
+
+  /* cfr-ConfigMCCH-MTCH: NULL (durch calloc) -> CORESET#0-Reuse */
+  return sib20;
 }
 
 static NR_PhysicalCellGroupConfig_t *configure_phy_cellgroup(void)

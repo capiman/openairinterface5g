@@ -1071,6 +1071,14 @@ bool nr_mac_configure_other_sib(gNB_MAC_INST *nrmac, int num_cu_sib, const f1ap_
         add_sib_to_systeminformation(sysInfov17, type_du);
         break;
       }
+      case NR_SIB_20: {
+        struct NR_SystemInformation_IEs__sib_TypeAndInfo__Member *type_du = calloc(1, sizeof(*type_du));
+        type_du->present = NR_SystemInformation_IEs__sib_TypeAndInfo__Member_PR_sib20_v1700;
+        NR_SIB20_r17_t *sib20 = get_SIB20_NR();
+        type_du->choice.sib20_v1700 = sib20;
+        add_sib_to_systeminformation(sysInfov17, type_du);  // sysInfov17!
+        break;
+      }
       default :
         AssertFatal(false, "Invalid or not supported SIB%d\n", sib_idx);
     }
