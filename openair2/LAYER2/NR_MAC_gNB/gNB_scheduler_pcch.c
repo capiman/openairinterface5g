@@ -15,6 +15,7 @@
 #include "common/utils/bits.h"
 #include "common/utils/ds/byte_array.h"
 #include "openair2/RRC/NR/MESSAGES/asn1_msg.h"
+#include "NR_MAC_gNB/nr_pws.h"
 #include "NR_PCCH-Config.h"
 
 void nr_mac_pcch_queue_free(NR_COMMON_channels_t *cc)
@@ -374,6 +375,159 @@ static bool is_paging_occasion(const NR_PCCH_Config_t *pcch,
   }
 }
 
+/* TS 38.331 6.5 Table 6.5-1: Short Message bit 1 is systemInfoModification,
+ * bit 2 is etwsAndCmasIndication. Bit 1 is the most significant bit of the
+ * 8 bit Short Message field. */
+#define NR_SHORT_MSG_SYSTEM_INFO_MODIFICATION 0x80
+#define NR_SHORT_MSG_ETWS_AND_CMAS_INDICATION 0x40
+
+/** @brief True if any PWS SIB (SIB6/SIB7/SIB8) is configured on this cell. */
+static bool pws_sib_configured(const NR_COMMON_channels_t *cc)
+{
+  if (!cc->du_SIBs)
+    return false;
+  for (size_t i = 0; i < cc->du_SIBs->size; i++) {
+    const nr_SIBs_t *si = (const nr_SIBs_t *)seq_arr_at(cc->du_SIBs, i);
+    if (si->SIB_type == NR_SIB_6 || si->SIB_type == NR_SIB_7 || si->SIB_type == NR_SIB_8)
+      return true;
+  }
+  return false;
+}
+
+/** @brief True if (frame, slot) is a PDCCH monitoring occasion for paging, for any UE_ID.
+ *
+ * The Short Message is not addressed to a single UE, so unlike is_paging_occasion()
+ * this does not restrict the occasion to one UE's PF/PO: every paging MO is used, which
+ * is the simple way to reach all UEs whatever their PO. */
+static bool is_any_paging_mo(gNB_MAC_INST *mac, NR_ServingCellConfigCommon_t *scc, NR_SearchSpace_t *ss, frame_t frame, slot_t slot)
+{
+  if (ss->searchSpaceId == 0)
+    return is_type0_occasion_paging(mac, scc, frame, slot);
+
+  int period = 0;
+  int offset = 0;
+  get_monitoring_period_offset(ss, &period, &offset);
+  if (period <= 0)
+    return false;
+  const int n_slots_frame = mac->frame_structure.numb_slots_frame;
+  return ((frame * n_slots_frame + slot) % period) == offset;
+}
+
+/** @brief Transmit the paging Short Message carrying etwsAndCmasIndication (TS 38.331 6.5).
+ *
+ * An ETWS or CMAS capable UE does not read SIB6/SIB7/SIB8 just because SIB1 announces
+ * them: it acts on the Short Message in its paging occasion, then re-acquires SIB1 and
+ * the PWS SIBs immediately (TS 38.331 5.2.2.2.3). This sends a DCI format 1_0 with CRC
+ * scrambled by P-RNTI and Short Messages Indicator = 10 (Short Message only), so no
+ * PDSCH and no PCCH payload are needed.
+ *
+ * Scope: this is a static lab trigger. The warning is broadcast for as long as the gNB
+ * runs and the Short Message is repeated every pws.short_message_period_rf radio frames,
+ * rather than being driven by a CBE/CBCF over NGAP Write-Replace Warning.
+ *
+ * @param mac    gNB MAC instance
+ * @param frameP Current SFN
+ * @param slotP  Current slot
+ * @param DL_req DL TTI request to fill with the PDCCH PDU for P-RNTI */
+static void schedule_nr_pws_short_message(gNB_MAC_INST *mac, frame_t frameP, slot_t slotP, nfapi_nr_dl_tti_request_t *DL_req)
+{
+  const int CC_id = 0;
+  NR_COMMON_channels_t *cc = &mac->common_channels[CC_id];
+
+  if (!pws_sib_configured(cc))
+    return;
+
+  const nr_pws_config_t *pws = nr_pws_get_config();
+  if (pws->short_message_period_rf == 0)
+    return;
+  if (frameP % pws->short_message_period_rf != 0)
+    return;
+  if (!is_dl_slot(slotP, &mac->frame_structure))
+    return;
+
+  NR_ServingCellConfigCommon_t *scc = cc->ServingCellConfigCommon;
+  NR_SearchSpace_t *ss = get_paging_search_space(scc);
+  if (ss == NULL) {
+    LOG_D(NR_MAC, "[%04d.%02d][gNB %d] no pagingSearchSpace, cannot send PWS Short Message\n", frameP, slotP, mac->Mod_id);
+    return;
+  }
+  if (!is_any_paging_mo(mac, scc, ss, frameP, slotP))
+    return;
+
+  AssertFatal(ss->controlResourceSetId, "paging search space id %ld has NULL controlResourceSetId\n", ss->searchSpaceId);
+  NR_ControlResourceSet_t *coreset = get_coreset(mac, scc, NULL, *ss->controlResourceSetId);
+
+  int ssb_for_paging = 0;
+  if (cc->num_active_ssb > 0)
+    ssb_for_paging = cc->ssb_index[0];
+  const int beam_index = get_beam_from_ssbidx(mac, ssb_for_paging);
+  const int n_slots_frame = mac->frame_structure.numb_slots_frame;
+  NR_beam_alloc_t beam = beam_allocation_procedure(&mac->beam_info, frameP, slotP, beam_index, n_slots_frame);
+  if (beam.idx < 0)
+    return;
+
+  NR_BWP_t *initial_dl_bwp = &scc->downlinkConfigCommon->initialDownlinkBWP->genericParameters;
+  NR_sched_pdcch_t sched_pdcch = set_pdcch_structure(mac, ss, coreset, scc, initial_dl_bwp, mac->type0_PDCCH_CSS_config);
+  int aggregation_level = 0;
+  int CCEIndex = get_cce_index(mac, CC_id, slotP, 0, &aggregation_level, beam.idx, ss, coreset, &sched_pdcch, 0.0f);
+  if (CCEIndex < 0) {
+    LOG_W(NR_MAC, "[%04d.%02d][gNB %d] no free CCE for PWS Short Message\n", frameP, slotP, mac->Mod_id);
+    return;
+  }
+  fill_pdcch_vrb_map(mac, CC_id, &sched_pdcch, CCEIndex, aggregation_level, beam.idx);
+
+  nfapi_nr_dl_tti_request_body_t *dl_req = &DL_req->dl_tti_request_body;
+  nfapi_nr_dl_tti_request_pdu_t *dl_tti_pdcch_pdu = &dl_req->dl_tti_pdu_list[dl_req->nPDUs];
+  memset(dl_tti_pdcch_pdu, 0, sizeof(*dl_tti_pdcch_pdu));
+  dl_tti_pdcch_pdu->PDUType = NFAPI_NR_DL_TTI_PDCCH_PDU_TYPE;
+  dl_tti_pdcch_pdu->PDUSize = 4 + sizeof(nfapi_nr_dl_tti_pdcch_pdu);
+  dl_req->nPDUs += 1;
+  nfapi_nr_dl_tti_pdcch_pdu_rel15_t *pdcch_pdu_rel15 = &dl_tti_pdcch_pdu->pdcch_pdu.pdcch_pdu_rel15;
+  nr_configure_pdcch(pdcch_pdu_rel15, coreset, &sched_pdcch);
+
+  const uint16_t fapi_beam = convert_to_fapi_beam(beam.idx, mac->beam_info.beam_mode);
+  const uint16_t *sidx = mac->radio_config.spatial_stream_index;
+  nfapi_nr_dl_dci_pdu_t *dci_pdu = prepare_dci_pdu(pdcch_pdu_rel15,
+                                                   scc,
+                                                   ss,
+                                                   coreset,
+                                                   &sidx[beam.idx],
+                                                   aggregation_level,
+                                                   CCEIndex,
+                                                   fapi_beam,
+                                                   P_RNTI);
+  pdcch_pdu_rel15->numDlDci++;
+
+  /* TS 38.212 Table 7.3.1.2.1-1: with SMI = 10 the PDSCH related fields of the
+   * P-RNTI DCI (frequency/time domain assignment, VRB-to-PRB, MCS, TB scaling)
+   * are reserved and left at zero. */
+  dci_pdu_rel15_t dci_payload = {0};
+  dci_payload.short_messages_indicator = NR_DCI_PRNTI_SMI_SHORT_MSG_ONLY;
+  dci_payload.short_messages = NR_SHORT_MSG_ETWS_AND_CMAS_INDICATION;
+
+  fill_dci_pdu_rel15(NULL,
+                     NULL,
+                     NULL,
+                     dci_pdu,
+                     &dci_payload,
+                     NR_DL_DCI_FORMAT_1_0,
+                     TYPE_P_RNTI_,
+                     0,
+                     ss,
+                     coreset,
+                     0,
+                     mac->cset0_bwp_size);
+
+  LOG_I(NR_MAC,
+        "[%04d.%02d][gNB %d] PWS Short Message sent (etwsAndCmasIndication) ss=%ld agg=%d CCE=%d\n",
+        frameP,
+        slotP,
+        mac->Mod_id,
+        ss->searchSpaceId,
+        aggregation_level,
+        CCEIndex);
+}
+
 typedef struct {
   frame_t frame;
   slot_t slot;
@@ -436,6 +590,9 @@ void schedule_nr_pcch(gNB_MAC_INST *mac,
   NR_ServingCellConfigCommon_t *scc = cc->ServingCellConfigCommon;
   DevAssert(scc);
   DevAssert(scc->downlinkConfigCommon);
+
+  /* PWS (ETWS/CMAS) notification, independent of any pending CN paging record */
+  schedule_nr_pws_short_message(mac, frameP, slotP, DL_req);
 
   /* PCCH-Config is in SIB1 (DownlinkConfigCommonSIB) */
   DevAssert(cc->sib1);

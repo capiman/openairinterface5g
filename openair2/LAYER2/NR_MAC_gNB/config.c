@@ -18,6 +18,7 @@
 #include "GNB_APP/gnb_config.h"
 #include "NR_MIB.h"
 #include "NR_MAC_gNB/nr_mac_gNB.h"
+#include "NR_MAC_gNB/nr_pws.h"
 #include "NR_BCCH-BCH-Message.h"
 #include "NR_ServingCellConfigCommon.h"
 #include "NR_MIB.h"
@@ -1063,6 +1064,30 @@ bool nr_mac_configure_other_sib(gNB_MAC_INST *nrmac, int num_cu_sib, const f1ap_
     int sib_idx = i + num_cu_sib;
     config_sibs[sib_idx] = si->SIB_type;
     switch (config_sibs[sib_idx]) {
+      /* PWS SIBs are Rel-15 SIBs (<= 14), so they go into the first SI container,
+       * not into sysInfov17. They are generated locally by the DU from the "pws"
+       * configuration section, see nr_pws.c. */
+      case NR_SIB_6: {
+        struct NR_SystemInformation_IEs__sib_TypeAndInfo__Member *type_du = calloc_or_fail(1, sizeof(*type_du));
+        type_du->present = NR_SystemInformation_IEs__sib_TypeAndInfo__Member_PR_sib6;
+        type_du->choice.sib6 = get_SIB6_NR();
+        add_sib_to_systeminformation(sysInfo, type_du);
+        break;
+      }
+      case NR_SIB_7: {
+        struct NR_SystemInformation_IEs__sib_TypeAndInfo__Member *type_du = calloc_or_fail(1, sizeof(*type_du));
+        type_du->present = NR_SystemInformation_IEs__sib_TypeAndInfo__Member_PR_sib7;
+        type_du->choice.sib7 = get_SIB7_NR();
+        add_sib_to_systeminformation(sysInfo, type_du);
+        break;
+      }
+      case NR_SIB_8: {
+        struct NR_SystemInformation_IEs__sib_TypeAndInfo__Member *type_du = calloc_or_fail(1, sizeof(*type_du));
+        type_du->present = NR_SystemInformation_IEs__sib_TypeAndInfo__Member_PR_sib8;
+        type_du->choice.sib8 = get_SIB8_NR();
+        add_sib_to_systeminformation(sysInfo, type_du);
+        break;
+      }
       case NR_SIB_19: {
         struct NR_SystemInformation_IEs__sib_TypeAndInfo__Member *type_du = calloc(1, sizeof(*type_du));
         type_du->present = NR_SystemInformation_IEs__sib_TypeAndInfo__Member_PR_sib19_v1700;
